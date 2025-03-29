@@ -40,7 +40,7 @@ A Model Context Protocol (MCP) server for controlling Minecraft servers via the 
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/mcss-mcp-server.git
+   git clone https://github.com/largeorbitalobject/mcss-mcp-server.git
    cd mcss-mcp-server
    ```
 
@@ -84,21 +84,9 @@ A Model Context Protocol (MCP) server for controlling Minecraft servers via the 
      ```
    - Replace the path with the actual path to the batch file on your system
 
-### Running the Server
-
-Run the server using the provided batch file:
-```bash
-run_mcss_mcp.bat
-```
-
-Or directly with Python:
-```bash
-python main.py
-```
-
 ## 🔧 Using the MCP Tools in Claude Desktop
 
-Once the server is running and connected to Claude Desktop, you can use the following tools:
+Once Claude Desktop is launched, the server will start automatically and you can use the following tools:
 
 ### Server Management
 
@@ -195,5 +183,5 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## 🙏 Acknowledgments
 
 - [MCSS](https://mcserversoft.com/) for providing the Minecraft server management software
-- [MCP](https://github.com/anthropics/anthropic-cookbook/tree/main/mcp) for the Model Context Protocol specification
+- [MCP](https://modelcontextprotocol.io/introduction) for the Model Context Protocol specification
 - [Claude Desktop](https://claude.ai/download) for the MCP client implementation
