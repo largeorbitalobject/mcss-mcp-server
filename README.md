@@ -14,6 +14,7 @@ A Model Context Protocol (MCP) server for controlling Minecraft servers via the 
   - Execute power actions (start, stop, restart, kill)
   - Execute Minecraft commands
   - View server console output in real-time
+  - Update server settings (name, description, crash handling, etc.)
 
 - **Backup Management**
   - List available backups
@@ -99,6 +100,11 @@ Returns a list of all Minecraft servers managed by MCSS.
 get_server_details(server_id)
 ```
 Returns detailed information about a specific server.
+
+```
+edit_server(server_id, name=None, description=None, is_set_to_auto_start=None, force_save_on_stop=None, java_allocated_memory=None, keep_online=None)
+```
+Updates a specific Minecraft server's settings. The `keep_online` parameter controls crash handling (0=none, 1=elevated, 2=aggressive).
 
 ```
 execute_server_action(server_id, action)
