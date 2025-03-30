@@ -97,6 +97,33 @@ class MCSSClient:
             except json.JSONDecodeError:
                 return {"error": "Invalid JSON response", "raw_response": response.text}
 
+    async def put(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Make a PUT request to the MCSS API.
+        
+        Args:
+            endpoint: The API endpoint to request
+            data: The JSON data to send
+            
+        Returns:
+            The JSON response from the API
+        """
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                f"{self.base_url}{endpoint}", 
+                json=data, 
+                headers=self.headers
+            )
+            response.raise_for_status()
+            
+            # Handle empty responses
+            if not response.text or response.text.isspace():
+                return {}
+                
+            try:
+                return response.json()
+            except json.JSONDecodeError:
+                return {"error": "Invalid JSON response", "raw_response": response.text}
+
     async def delete(self, endpoint: str) -> Dict[str, Any]:
         """Make a DELETE request to the MCSS API.
         
@@ -965,6 +992,72 @@ async def run_scheduler_task(server_id: str, task_id: str) -> str:
             return f"Failed to run task with ID: {task_id}. Error: {response.get('message', 'Unknown error')}"
     except Exception as e:
         return f"Error running task: {str(e)}"
+
+
+@mcp.tool()
+async def edit_server(server_id: str, name: str = None, description: str = None, 
+                     is_set_to_auto_start: bool = None, force_save_on_stop: bool = None,
+                     java_allocated_memory: int = None, keep_online: int = None) -> str:
+    """Update a specific Minecraft server's settings.
+    
+    Args:
+        server_id: The ID of the server to update
+        name: New name for the server
+        description: New description for the server
+        is_set_to_auto_start: Whether the server should auto-start
+        force_save_on_stop: Whether to force save on stop
+        java_allocated_memory: Amount of memory to allocate to Java (in MB)
+        keep_online: Crash handling setting (0=none, 1=elevated, 2=aggressive)
+    
+    Returns:
+        A message indicating the result of the update
+    """
+    try:
+        # Build the update payload with only the provided parameters
+        update_data = {}
+        if name is not None:
+            update_data["name"] = name
+        if description is not None:
+            update_data["description"] = description
+        if is_set_to_auto_start is not None:
+            update_data["isSetToAutoStart"] = is_set_to_auto_start
+        if force_save_on_stop is not None:
+            update_data["forceSaveOnStop"] = force_save_on_stop
+        if java_allocated_memory is not None:
+            update_data["javaAllocatedMemory"] = java_allocated_memory
+        if keep_online is not None:
+            # Convert the integer value to the keepOnline object format
+            update_data["keepOnline"] = keep_online
+        
+        # If no parameters were provided, return an error
+        if not update_data:
+            return "No update parameters provided. Please specify at least one parameter to update."
+        
+        # Make the API request to update the server using PUT as specified in the API docs
+        response = await mcss_client.put(f"/servers/{server_id}", update_data)
+        
+        # Check if the update was successful
+        if "error" in response:
+            return f"Error updating server: {response['error']}"
+        
+        # Get the updated server details to confirm changes
+        updated_server = await mcss_client.get(f"/servers/{server_id}")
+        
+        # Format the response with the updated server details
+        details = [
+            f"Server updated successfully!",
+            f"Server ID: {updated_server.get('serverId', 'N/A')}",
+            f"Name: {updated_server.get('name', 'N/A')}",
+            f"Description: {updated_server.get('description', 'N/A')}",
+            f"Auto Start: {'Yes' if updated_server.get('isSetToAutoStart', False) else 'No'}",
+            f"Force Save on Stop: {'Yes' if updated_server.get('forceSaveOnStop', False) else 'No'}",
+            f"Java Memory: {updated_server.get('javaAllocatedMemory', 'N/A')} MB",
+            f"Keep Online: {updated_server.get('keepOnline', 'N/A')}"
+        ]
+        
+        return "\n".join(details)
+    except Exception as e:
+        return f"Error updating server: {str(e)}"
 
 
 if __name__ == "__main__":
