@@ -8,7 +8,10 @@ through the Model Context Protocol (MCP).
 import os
 import sys
 import json
-from typing import Any, Dict, List, Optional
+import time
+import logging
+import traceback
+from typing import Any, Dict, List, Optional, Union
 from datetime import datetime
 
 # Add the packages directory to the Python path
@@ -18,6 +21,17 @@ sys.path.insert(0, packages_dir)
 import httpx
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("mcss_api.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("mcss_mcp")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -29,46 +43,254 @@ mcp = FastMCP("mcss-control")
 DEFAULT_HOST = os.environ.get("MCSS_HOST", "localhost")
 DEFAULT_PORT = int(os.environ.get("MCSS_PORT", "8821"))  # Default MCSS web panel port
 API_KEY = os.environ.get("MCSS_API_KEY", "")  # Get API key from environment variable
+DEFAULT_TIMEOUT = float(os.environ.get("MCSS_TIMEOUT", "30.0"))  # Default timeout in seconds
+MAX_RETRIES = int(os.environ.get("MCSS_MAX_RETRIES", "3"))  # Default number of retries
+RETRY_DELAY = float(os.environ.get("MCSS_RETRY_DELAY", "1.0"))  # Default delay between retries in seconds
 
 
 class MCSSClient:
     """Client for interacting with the MCSS API."""
     
-    def __init__(self, host: str = None, port: int = None, api_key: str = None):
+    def __init__(self, host: str = None, port: int = None, api_key: str = None, 
+                 timeout: float = None, max_retries: int = None, retry_delay: float = None):
         """Initialize the MCSS API client.
         
         Args:
             host: The hostname or IP address of the MCSS server
             port: The port of the MCSS web panel
             api_key: The API key for authentication
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay between retries in seconds
         """
         self.host = host or os.environ.get("MCSS_HOST", DEFAULT_HOST)
         self.port = port or int(os.environ.get("MCSS_PORT", DEFAULT_PORT))
         self.api_key = api_key or os.environ.get("MCSS_API_KEY", API_KEY)
+        self.timeout = timeout or float(os.environ.get("MCSS_TIMEOUT", DEFAULT_TIMEOUT))
+        self.max_retries = max_retries or int(os.environ.get("MCSS_MAX_RETRIES", MAX_RETRIES))
+        self.retry_delay = retry_delay or float(os.environ.get("MCSS_RETRY_DELAY", RETRY_DELAY))
         self.base_url = f"http://{self.host}:{self.port}/api/v2"
         self.headers = {"apiKey": self.api_key}
+        self.session = None
+        
+        # Circuit breaker pattern properties
+        self.circuit_open = False
+        self.failure_count = 0
+        self.failure_threshold = 3  # Number of failures before opening circuit
+        self.circuit_reset_time = 30  # Seconds to wait before trying again
+        self.last_circuit_open_time = 0
+        
+        # Request pacing properties
+        self.last_request_time = 0
+        self.min_request_interval = 0.5  # Minimum seconds between requests
+        
+        # Connection health tracking
+        self.consecutive_timeouts = 0
+        self.max_consecutive_timeouts = 2
+        self.total_requests = 0
+        self.successful_requests = 0
+        
+        logger.info(f"Initialized MCSS client for {self.base_url}")
     
-    async def get(self, endpoint: str) -> Dict[str, Any]:
-        """Make a GET request to the MCSS API.
+    async def _get_session(self) -> httpx.AsyncClient:
+        """Get or create an httpx AsyncClient session.
+        
+        Returns:
+            An httpx AsyncClient instance
+        """
+        if self.session is None or self.session.is_closed:
+            self.session = httpx.AsyncClient(timeout=self.timeout)
+            logger.debug("Created new httpx AsyncClient session")
+        return self.session
+    
+    async def _close_session(self):
+        """Close the httpx AsyncClient session if it exists."""
+        if self.session and not self.session.is_closed:
+            await self.session.aclose()
+            self.session = None
+            logger.debug("Closed httpx AsyncClient session")
+    
+    async def _make_request(self, method: str, endpoint: str, 
+                           data: Dict[str, Any] = None, 
+                           params: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Make an HTTP request to the MCSS API with retry logic.
         
         Args:
+            method: The HTTP method to use (GET, POST, PUT, DELETE)
             endpoint: The API endpoint to request
+            data: The JSON data to send (for POST/PUT requests)
+            params: The query parameters to include (for GET requests)
             
         Returns:
             The JSON response from the API
         """
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{self.base_url}{endpoint}", headers=self.headers)
-            response.raise_for_status()
-            
-            # Handle empty responses
-            if not response.text or response.text.isspace():
-                return {}
-                
+        import asyncio
+        import random
+        
+        url = f"{self.base_url}{endpoint}"
+        method = method.upper()
+        self.total_requests += 1
+        
+        # Check if circuit breaker is open
+        current_time = time.time()
+        if self.circuit_open:
+            if current_time - self.last_circuit_open_time < self.circuit_reset_time:
+                logger.warning(f"Circuit breaker open, rejecting request to {endpoint}")
+                return {"error": "Circuit breaker open due to multiple failures"}
+            else:
+                # Reset circuit breaker after timeout
+                logger.info("Circuit breaker reset, allowing requests again")
+                self.circuit_open = False
+                self.failure_count = 0
+                self.consecutive_timeouts = 0
+        
+        # Implement request pacing
+        time_since_last_request = current_time - self.last_request_time
+        if time_since_last_request < self.min_request_interval:
+            await asyncio.sleep(self.min_request_interval - time_since_last_request)
+        
+        # Update last request time
+        self.last_request_time = time.time()
+        
+        # Make the request with retries
+        attempts = 0
+        last_error = None
+        retry_delay = self.retry_delay
+        
+        while attempts < self.max_retries + 1:
+            attempts += 1
             try:
-                return response.json()
-            except json.JSONDecodeError:
-                return {"error": "Invalid JSON response", "raw_response": response.text}
+                logger.debug(f"Request attempt {attempts}/{self.max_retries + 1}: {method} {url}")
+                
+                client = await self._get_session()
+                
+                if method == "GET":
+                    response = await client.get(url, headers=self.headers, params=params)
+                elif method == "POST":
+                    response = await client.post(url, json=data, headers=self.headers)
+                elif method == "PUT":
+                    response = await client.put(url, json=data, headers=self.headers)
+                elif method == "DELETE":
+                    response = await client.delete(url, headers=self.headers)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+                
+                # Log response status and timing
+                logger.debug(f"Response status: {response.status_code} for {method} {url}")
+                
+                # Handle HTTP errors
+                response.raise_for_status()
+                
+                # Handle empty responses
+                if not response.text or response.text.isspace():
+                    logger.debug(f"Empty response received from {method} {url}")
+                    
+                    # Reset failure counters on success
+                    self.failure_count = 0
+                    self.consecutive_timeouts = 0
+                    self.successful_requests += 1
+                    
+                    return {}
+                
+                # Parse JSON response
+                try:
+                    result = response.json()
+                    
+                    # Reset failure counters on success
+                    self.failure_count = 0
+                    self.consecutive_timeouts = 0
+                    self.successful_requests += 1
+                    
+                    return result
+                except json.JSONDecodeError as e:
+                    logger.warning(f"JSON decode error for {method} {url}: {str(e)}")
+                    logger.debug(f"Raw response: {response.text[:500]}...")
+                    
+                    # This is a partial success - we got a response but couldn't parse it
+                    self.consecutive_timeouts = 0
+                    self.failure_count += 0.5  # Count as half a failure
+                    
+                    return {"error": "Invalid JSON response", "raw_response": response.text[:1000]}
+                
+            except httpx.TimeoutException as e:
+                last_error = e
+                self.consecutive_timeouts += 1
+                self.failure_count += 1
+                logger.warning(f"Timeout error on attempt {attempts}/{self.max_retries + 1} for {method} {url}: {str(e)}")
+                
+                # Check if we need to open the circuit breaker due to consecutive timeouts
+                if self.consecutive_timeouts >= self.max_consecutive_timeouts:
+                    logger.warning(f"Opening circuit breaker after {self.consecutive_timeouts} consecutive timeouts")
+                    self.circuit_open = True
+                    self.last_circuit_open_time = time.time()
+                    break
+                    
+            except httpx.ConnectError as e:
+                last_error = e
+                self.failure_count += 1
+                logger.warning(f"Connection error on attempt {attempts}/{self.max_retries + 1} for {method} {url}: {str(e)}")
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                self.failure_count += 1
+                logger.warning(f"HTTP error {e.response.status_code} on attempt {attempts}/{self.max_retries + 1} for {method} {url}: {str(e)}")
+                
+                # Don't retry client errors (4xx) except for 429 (Too Many Requests)
+                if e.response.status_code >= 400 and e.response.status_code < 500 and e.response.status_code != 429:
+                    break
+                    
+                # If we get a 429 (Too Many Requests), increase the pacing interval
+                if e.response.status_code == 429:
+                    self.min_request_interval = min(self.min_request_interval * 2, 5.0)
+                    logger.info(f"Rate limit detected, increased request interval to {self.min_request_interval}s")
+                    
+            except Exception as e:
+                last_error = e
+                self.failure_count += 1
+                logger.warning(f"Unexpected error on attempt {attempts}/{self.max_retries + 1} for {method} {url}: {str(e)}")
+                logger.debug(traceback.format_exc())
+            
+            # Check if we need to open the circuit breaker
+            if self.failure_count >= self.failure_threshold:
+                logger.warning(f"Opening circuit breaker after {self.failure_count} failures")
+                self.circuit_open = True
+                self.last_circuit_open_time = time.time()
+                break
+            
+            # If this wasn't the last attempt, wait before retrying
+            if attempts <= self.max_retries:
+                # Exponential backoff with jitter
+                jitter = random.uniform(0.8, 1.2)
+                delay = retry_delay * (2 ** (attempts - 1)) * jitter
+                delay = min(delay, 30)  # Cap at 30 seconds
+                logger.debug(f"Retrying in {delay:.2f} seconds...")
+                await asyncio.sleep(delay)
+            else:
+                # Close the session on the last failed attempt
+                await self._close_session()
+        
+        # If we got here, all attempts failed
+        error_msg = str(last_error) if last_error else "Unknown error"
+        logger.error(f"All {attempts} attempts failed for {method} {url}: {error_msg}")
+        
+        # If we've had too many failures, consider reopening the circuit
+        if not self.circuit_open and self.failure_count >= self.failure_threshold:
+            logger.warning(f"Opening circuit breaker after {self.failure_count} failures")
+            self.circuit_open = True
+            self.last_circuit_open_time = time.time()
+        
+        return {"error": f"Request failed after {attempts} attempts: {error_msg}"}
+    
+    async def get(self, endpoint: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Make a GET request to the MCSS API.
+        
+        Args:
+            endpoint: The API endpoint to request
+            params: The query parameters to include
+            
+        Returns:
+            The JSON response from the API
+        """
+        return await self._make_request("GET", endpoint, params=params)
     
     async def post(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Make a POST request to the MCSS API.
@@ -80,22 +302,7 @@ class MCSSClient:
         Returns:
             The JSON response from the API
         """
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{self.base_url}{endpoint}", 
-                json=data, 
-                headers=self.headers
-            )
-            response.raise_for_status()
-            
-            # Handle empty responses
-            if not response.text or response.text.isspace():
-                return {}
-                
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                return {"error": "Invalid JSON response", "raw_response": response.text}
+        return await self._make_request("POST", endpoint, data=data)
 
     async def put(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Make a PUT request to the MCSS API.
@@ -107,22 +314,7 @@ class MCSSClient:
         Returns:
             The JSON response from the API
         """
-        async with httpx.AsyncClient() as client:
-            response = await client.put(
-                f"{self.base_url}{endpoint}", 
-                json=data, 
-                headers=self.headers
-            )
-            response.raise_for_status()
-            
-            # Handle empty responses
-            if not response.text or response.text.isspace():
-                return {}
-                
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                return {"error": "Invalid JSON response", "raw_response": response.text}
+        return await self._make_request("PUT", endpoint, data=data)
 
     async def delete(self, endpoint: str) -> Dict[str, Any]:
         """Make a DELETE request to the MCSS API.
@@ -133,22 +325,55 @@ class MCSSClient:
         Returns:
             The JSON response from the API
         """
-        async with httpx.AsyncClient() as client:
-            response = await client.delete(f"{self.base_url}{endpoint}", headers=self.headers)
-            response.raise_for_status()
-            
-            # Handle empty responses
-            if not response.text or response.text.isspace():
-                return {}
-                
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                return {"error": "Invalid JSON response", "raw_response": response.text}
+        return await self._make_request("DELETE", endpoint)
 
+    def get_health_check_url(self) -> str:
+        """Get the URL for a health check.
+        
+        Returns:
+            The health check URL
+        """
+        return f"{self.base_url}/servers"
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform a health check on the MCSS API.
+        
+        Returns:
+            A dictionary with health check results
+        """
+        start_time = time.time()
+        try:
+            response = await self.get("/servers")
+            elapsed = time.time() - start_time
+            
+            if "error" in response:
+                return {
+                    "status": "error",
+                    "message": response["error"],
+                    "response_time": elapsed
+                }
+            
+            return {
+                "status": "healthy",
+                "message": "MCSS API is responding normally",
+                "response_time": elapsed,
+                "server_count": len(response) if isinstance(response, list) else 0
+            }
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Health check failed: {str(e)}")
+            return {
+                "status": "error",
+                "message": str(e),
+                "response_time": elapsed
+            }
 
 # Initialize MCSS client with environment variables
-mcss_client = MCSSClient(os.environ.get("MCSS_HOST", DEFAULT_HOST), int(os.environ.get("MCSS_PORT", DEFAULT_PORT)), os.environ.get("MCSS_API_KEY", API_KEY))
+mcss_client = MCSSClient(
+    os.environ.get("MCSS_HOST", DEFAULT_HOST), 
+    int(os.environ.get("MCSS_PORT", DEFAULT_PORT)), 
+    os.environ.get("MCSS_API_KEY", API_KEY)
+)
 
 
 # MCP Tools for MCSS API
@@ -160,10 +385,18 @@ async def get_servers() -> str:
         A formatted string containing information about all servers
     """
     try:
+        logger.info("Fetching server list")
         response = await mcss_client.get("/servers")
+        
+        if "error" in response:
+            error_msg = f"Error fetching servers: {response['error']}"
+            logger.error(error_msg)
+            return error_msg
+        
         servers = response  # The response is already a list of servers
         
         if not servers:
+            logger.info("No servers found")
             return "No servers found."
         
         result = []
@@ -177,9 +410,13 @@ async def get_servers() -> str:
             )
             result.append(server_info)
         
+        logger.info(f"Successfully fetched {len(servers)} servers")
         return "\n---\n".join(result)
     except Exception as e:
-        return f"Error fetching servers: {str(e)}"
+        error_msg = f"Error fetching servers: {str(e)}"
+        logger.error(error_msg)
+        logger.debug(traceback.format_exc())
+        return error_msg
 
 
 @mcp.tool()
@@ -193,10 +430,18 @@ async def get_server_details(server_id: str) -> str:
         A formatted string containing detailed information about the server
     """
     try:
+        logger.info(f"Fetching details for server {server_id}")
         response = await mcss_client.get(f"/servers/{server_id}")
+        
+        if "error" in response:
+            error_msg = f"Error getting server details: {response['error']}"
+            logger.error(error_msg)
+            return error_msg
+        
         server = response  # The response is the server details
         
         if not server:
+            logger.info(f"No server details found for {server_id}")
             return "No server details found."
         
         details = [
@@ -210,9 +455,13 @@ async def get_server_details(server_id: str) -> str:
             f"Java Memory: {server.get('javaAllocatedMemory', 'N/A')} MB"
         ]
         
+        logger.info(f"Successfully fetched details for server {server_id}")
         return "\n".join(details)
     except Exception as e:
-        return f"Error getting server details: {str(e)}"
+        error_msg = f"Error getting server details: {str(e)}"
+        logger.error(error_msg)
+        logger.debug(traceback.format_exc())
+        return error_msg
 
 
 @mcp.tool()
@@ -1059,6 +1308,203 @@ async def edit_server(server_id: str, name: str = None, description: str = None,
     except Exception as e:
         return f"Error updating server: {str(e)}"
 
+
+@mcp.tool()
+async def health_check_mcss_api() -> str:
+    """Perform a health check on the MCSS API to verify connectivity and response time.
+    
+    Returns:
+        A formatted string with health check results
+    """
+    try:
+        logger.info("Performing MCSS API health check")
+        result = await mcss_client.health_check()
+        
+        status = result.get("status", "unknown")
+        message = result.get("message", "No message")
+        response_time = result.get("response_time", 0)
+        server_count = result.get("server_count", 0)
+        
+        if status == "healthy":
+            health_info = [
+                f" MCSS API Health Check: HEALTHY",
+                f"Message: {message}",
+                f"Response Time: {response_time:.3f} seconds",
+                f"Server Count: {server_count}",
+                f"API URL: {mcss_client.base_url}"
+            ]
+            logger.info(f"Health check successful: {message}")
+        else:
+            health_info = [
+                f" MCSS API Health Check: ERROR",
+                f"Message: {message}",
+                f"Response Time: {response_time:.3f} seconds",
+                f"API URL: {mcss_client.base_url}"
+            ]
+            logger.error(f"Health check failed: {message}")
+        
+        return "\n".join(health_info)
+    except Exception as e:
+        error_msg = f"Error performing health check: {str(e)}"
+        logger.error(error_msg)
+        logger.debug(traceback.format_exc())
+        return error_msg
+
+
+@mcp.tool()
+async def monitor_mcss_connection(duration_seconds: int = 60, interval_seconds: int = 5) -> str:
+    """Monitor the MCSS API connection over a period of time to detect intermittent issues.
+    
+    Args:
+        duration_seconds: Total duration to monitor in seconds
+        interval_seconds: Interval between checks in seconds
+    
+    Returns:
+        A formatted string with monitoring results
+    """
+    try:
+        if duration_seconds < 5:
+            return "Duration must be at least 5 seconds"
+        if interval_seconds < 1:
+            return "Interval must be at least 1 second"
+        
+        total_checks = duration_seconds // interval_seconds
+        if total_checks > 100:
+            return "Too many checks requested. Please reduce duration or increase interval."
+        
+        logger.info(f"Starting MCSS API connection monitoring for {duration_seconds} seconds (interval: {interval_seconds}s)")
+        
+        results = []
+        successful_checks = 0
+        failed_checks = 0
+        response_times = []
+        
+        for i in range(total_checks):
+            check_number = i + 1
+            start_time = time.time()
+            
+            try:
+                logger.debug(f"Performing check {check_number}/{total_checks}")
+                response = await mcss_client.get("/servers")
+                end_time = time.time()
+                elapsed = end_time - start_time
+                response_times.append(elapsed)
+                
+                if "error" in response:
+                    failed_checks += 1
+                    status = " ERROR"
+                    message = response["error"]
+                    logger.warning(f"Check {check_number} failed: {message}")
+                else:
+                    successful_checks += 1
+                    status = " OK"
+                    message = f"Found {len(response) if isinstance(response, list) else 0} servers"
+                    logger.info(f"Check {check_number} successful: {message}")
+                
+                results.append(f"Check {check_number}/{total_checks}: {status} - Response time: {elapsed:.3f}s - {message}")
+                
+                # Wait for the next interval, but subtract the time already spent on the request
+                wait_time = max(0.1, interval_seconds - (end_time - start_time))
+                await asyncio.sleep(wait_time)
+                
+            except Exception as e:
+                end_time = time.time()
+                elapsed = end_time - start_time
+                failed_checks += 1
+                status = " ERROR"
+                message = str(e)
+                logger.error(f"Check {check_number} exception: {message}")
+                results.append(f"Check {check_number}/{total_checks}: {status} - Response time: {elapsed:.3f}s - Exception: {message}")
+                
+                # Wait for the next interval
+                wait_time = max(0.1, interval_seconds - (end_time - start_time))
+                await asyncio.sleep(wait_time)
+        
+        # Calculate statistics
+        success_rate = (successful_checks / total_checks) * 100 if total_checks > 0 else 0
+        avg_response_time = sum(response_times) / len(response_times) if response_times else 0
+        min_response_time = min(response_times) if response_times else 0
+        max_response_time = max(response_times) if response_times else 0
+        
+        summary = [
+            f"\n=== MCSS API Connection Monitoring Summary ===",
+            f"Duration: {duration_seconds} seconds",
+            f"Interval: {interval_seconds} seconds",
+            f"Total Checks: {total_checks}",
+            f"Successful: {successful_checks} ({success_rate:.1f}%)",
+            f"Failed: {failed_checks} ({100 - success_rate:.1f}%)",
+            f"Average Response Time: {avg_response_time:.3f}s",
+            f"Min Response Time: {min_response_time:.3f}s",
+            f"Max Response Time: {max_response_time:.3f}s",
+            f"API URL: {mcss_client.base_url}",
+            f"=== Detailed Results ===\n"
+        ]
+        
+        logger.info(f"Monitoring complete - Success rate: {success_rate:.1f}%, Avg response time: {avg_response_time:.3f}s")
+        return "\n".join(summary + results)
+    except Exception as e:
+        error_msg = f"Error monitoring connection: {str(e)}"
+        logger.error(error_msg)
+        logger.debug(traceback.format_exc())
+        return error_msg
+
+
+@mcp.tool()
+async def set_connection_parameters(timeout: float = None, max_retries: int = None, retry_delay: float = None) -> str:
+    """Set connection parameters for the MCSS API client.
+    
+    Args:
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay between retries in seconds
+    
+    Returns:
+        A message indicating the updated connection parameters
+    """
+    try:
+        # Store original values to report changes
+        original_timeout = mcss_client.timeout
+        original_max_retries = mcss_client.max_retries
+        original_retry_delay = mcss_client.retry_delay
+        
+        # Update values if provided
+        if timeout is not None:
+            if timeout < 1.0:
+                return "Timeout must be at least 1.0 seconds"
+            mcss_client.timeout = timeout
+        
+        if max_retries is not None:
+            if max_retries < 1:
+                return "Max retries must be at least 1"
+            mcss_client.max_retries = max_retries
+        
+        if retry_delay is not None:
+            if retry_delay < 0.1:
+                return "Retry delay must be at least 0.1 seconds"
+            mcss_client.retry_delay = retry_delay
+        
+        # Close any existing session to apply new timeout
+        await mcss_client._close_session()
+        
+        # Log the changes
+        changes = []
+        if timeout is not None:
+            changes.append(f"Timeout: {original_timeout}s -> {mcss_client.timeout}s")
+        if max_retries is not None:
+            changes.append(f"Max Retries: {original_max_retries} -> {mcss_client.max_retries}")
+        if retry_delay is not None:
+            changes.append(f"Retry Delay: {original_retry_delay}s -> {mcss_client.retry_delay}s")
+        
+        if not changes:
+            return "No connection parameters were changed"
+        
+        logger.info(f"Updated connection parameters: {', '.join(changes)}")
+        return f"Connection parameters updated:\n" + "\n".join(changes)
+    except Exception as e:
+        error_msg = f"Error setting connection parameters: {str(e)}"
+        logger.error(error_msg)
+        logger.debug(traceback.format_exc())
+        return error_msg
 
 if __name__ == "__main__":
     # Initialize and run the server
